@@ -13,6 +13,7 @@ import {
 import sharp from 'sharp';
 import { createReadStream, readFileSync, statSync } from 'fs';
 import { Readable } from 'stream';
+import { resolveConcurrentProviderError } from './x-upload-error';
 
 // Media reads answer headers in well under a second and the chunk sizes the
 // providers ask for finish in under two, with the slowest healthy read we
@@ -506,9 +507,43 @@ export abstract class SocialAbstract {
     try {
       value = await func();
     } catch (err) {
-      const handle = this.handleErrors(safeStringify(err), 200);
-      value = { err: true, value: 'Unknown Error', ...(handle || {}) };
-      globalErr = err;
+      // A provider that already chose BadBody / RefreshToken / Disconnect keeps
+      // that failure. X upload errors are classified from the SDK class and a
+      // closed category, never from err.message. Other providers keep the
+      // historical Unknown Error path.
+      const resolution = resolveConcurrentProviderError({
+        identifier: this.identifier,
+        err,
+        alreadyClassified:
+          err instanceof BadBody ||
+          err instanceof RefreshToken ||
+          err instanceof Disconnect,
+        handleErrors: (body, status) => this.handleErrors(body, status),
+      });
+      if (resolution.action === 'rethrow-classified') {
+        throw err;
+      }
+      if (resolution.action === 'throw') {
+        const message = resolution.message;
+        const safeJson = resolution.safeJson;
+        if (resolution.failureType === 'refresh-token') {
+          throw new RefreshToken(this.identifier, safeJson, '{}', message);
+        }
+        if (resolution.failureType === 'disconnect') {
+          throw new Disconnect(this.identifier, safeJson, '{}', message);
+        }
+        throw new BadBody(this.identifier, safeJson, '{}', message);
+      }
+      // Resolver returns throw for every X error. This remains so a missed
+      // branch still cannot store Unknown Error or the raw exception.
+      if (this.identifier === 'x') {
+        value = { err: true, value: 'X rejected the media upload (unclassified)' };
+        globalErr = {};
+      } else {
+        const handle = this.handleErrors(safeStringify(err), 200);
+        value = { err: true, value: 'Unknown Error', ...(handle || {}) };
+        globalErr = err;
+      }
     }
 
     if (value && value?.err && value?.value) {
