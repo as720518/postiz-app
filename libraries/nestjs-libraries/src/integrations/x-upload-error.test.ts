@@ -102,6 +102,27 @@ test('sanitizeProviderText drops urls, secrets, and account ids', () => {
   assert.equal(sanitizeProviderText(`Bearer ${SECRET}`), undefined);
   assert.equal(sanitizeProviderText(''), undefined);
   assert.equal(sanitizeProviderText(400), undefined);
+  assert.equal(sanitizeProviderText('ab12cd34ef56'), undefined);
+  assert.equal(sanitizeProviderText('prefix ab12cd34ef56 suffix'), undefined);
+});
+
+test('sanitizeProviderText scans the whole field before clipping', () => {
+  const filler = 'valid ';
+  assert.equal(filler.length, 6);
+  const nearLimit = filler.repeat(29) + 'ab12cd34ef56';
+  assert.ok(filler.repeat(29).length < 180);
+  assert.ok(filler.repeat(29).length + 'ab12'.length <= 180);
+  assert.equal(sanitizeProviderText(nearLimit), undefined);
+
+  const pastLimit = filler.repeat(32) + 'SYNTHETICCredentialSentinel123456789';
+  assert.ok(filler.repeat(32).length > 180);
+  assert.equal(sanitizeProviderText(pastLimit), undefined);
+
+  const safe = 'The image dimensions are too small. '.repeat(8).trim();
+  assert.ok(safe.length > 180);
+  const clipped = sanitizeProviderText(safe);
+  assert.equal(clipped, Array.from(safe).slice(0, 180).join(''));
+  assert.equal(clipped?.includes('ab12'), false);
 });
 
 test('representative ApiResponseError exposes only whitelisted fields', () => {
@@ -317,7 +338,7 @@ test('a cause-wrapped ApiResponseError is read once and its wrapper message is i
       cause: apiError({
         title: 'Invalid media',
         detail: 'Unsupported image format',
-        type: 'https://api.twitter.com/2/problems/invalid-media',
+        type: 'https://api.twitter.com/2/problems/invalid-request',
       }),
     },
   });
@@ -326,7 +347,7 @@ test('a cause-wrapped ApiResponseError is read once and its wrapper message is i
   if (resolution.action !== 'throw') {
     return;
   }
-  assert.match(resolution.message, /type invalid-media/);
+  assert.match(resolution.message, /type invalid-request/);
   assert.match(resolution.message, /Unsupported image format/);
   assertNoSecrets(JSON.stringify(resolution));
 });
@@ -389,6 +410,49 @@ test('posts list curated error shows the bad_body summary and hides Unknown Erro
     ),
     null
   );
+});
+
+test('string codes and unknown problem slugs are dropped, official slugs stay', () => {
+  const sentinel = 'SYNTHETICCredentialSentinel123456789';
+  const cases: Array<{ code?: unknown; type?: unknown; expectType?: string; expectCode?: number }> = [
+    { code: sentinel, type: sentinel },
+    { code: 'ab', type: 'zz' },
+    { code: 'ab12cd34ef56', type: 'not-a-real-problem' },
+    { code: '324abc', type: `https://api.twitter.com/2/problems/${sentinel}` },
+    { code: sentinel, type: 'https://api.x.com/2/problems/ab12cd34ef56' },
+    { code: 324, type: 'https://api.twitter.com/2/problems/invalid-request', expectType: 'invalid-request', expectCode: 324 },
+    { code: 88, type: 'usage-capped', expectType: 'usage-capped', expectCode: 88 },
+    { code: 403, type: 'https://api.x.com/2/problems/duplicate-rules', expectType: 'duplicate-rules', expectCode: 403 },
+    { type: 'https://api.twitter.com/2/problems/invalid-media' },
+  ];
+
+  for (const item of cases) {
+    const resolution = resolveConcurrentProviderError({
+      identifier: 'x',
+      alreadyClassified: false,
+      err: apiError({
+        title: 'Invalid media',
+        detail: 'Animated GIF is not allowed',
+        ...(item.type !== undefined ? { type: item.type } : {}),
+        errors: item.code !== undefined ? [{ code: item.code, message: 'kept out' }] : [],
+      }),
+    });
+    assert.equal(resolution.action, 'throw');
+    if (resolution.action !== 'throw') {
+      continue;
+    }
+    const stored = resolution.message + resolution.safeJson;
+    assert.equal(stored.includes(sentinel), false);
+    assert.equal(stored.includes('ab12cd34ef56'), false);
+    assert.equal(stored.includes('not-a-real-problem'), false);
+    assert.equal(stored.includes('invalid-media'), false);
+    assert.equal(stored.includes('324abc'), false);
+    const body = JSON.parse(resolution.safeJson);
+    assert.equal(body.httpStatus, 400);
+    assert.equal(body.code, item.expectCode);
+    assert.equal(body.type, item.expectType);
+    assert.equal(typeof body.code === 'string', false);
+  }
 });
 
 test('provider source still owns the static mappings and the upload catch uses them', () => {

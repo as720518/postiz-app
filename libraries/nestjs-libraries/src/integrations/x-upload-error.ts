@@ -24,23 +24,41 @@ const MAX_TEXT = 180;
 const MAX_SCAN_FIELD = 500;
 const MAX_SCAN = 2_000;
 
+// Documented X API problem slugs. Anything else, including a credential placed
+// in data.type or in the /2/problems/ path, is omitted.
+// https://docs.x.com/x-api/fundamentals/response-codes-and-errors
+// plus the anchors named by twitter-api-v2@1.29.0 EApiV2ErrorCode.
+const OFFICIAL_PROBLEM_SLUGS = new Set([
+  'invalid-request',
+  'resource-not-found',
+  'not-authorized-for-resource',
+  'client-forbidden',
+  'usage-capped',
+  'rate-limit-exceeded',
+  'streaming-connection',
+  'rule-cap',
+  'invalid-rules',
+  'duplicate-rules',
+  'unsupported-authentication',
+  'client-disconnected',
+  'operational-disconnect',
+  'disallowed-resource',
+]);
+
 const SECRET_TEXT =
   /[\u0000-\u001f\u007f]|:\/\/|www\.|bearer\s+|eyJ[a-z0-9_-]{8,}|%[0-9a-f]{2}|\?[^\s]*?=|[?&][a-z0-9_]+=|\b\d{7,}\b|\b(?:access_token|refresh_token|id_token|api_key|apikey|api_secret|client_secret|oauth_token|oauth_token_secret|authorization|cookie|set-cookie|password|secret)\b|[A-Za-z0-9+/]{32,}={0,2}|[A-Fa-f0-9]{32,}|@[a-z0-9.-]+\.[a-z]{2,}/i;
 
-// A short provider sentence is kept. A long opaque token is not, even when it
-// does not match a known keyword: the field is dropped instead of redacted.
+// Reject the whole field when any token is long or mixes letters with digits
+// for 12 or more characters. Lowercase does not exempt a token.
 function hasOpaqueToken(text: string): boolean {
-  for (const part of text.split(/\s+/)) {
-    if (
-      /^[a-z0-9]+(?:-[a-z0-9]+){0,4}$/.test(part) &&
-      part.split('-').every((segment) => segment.length > 0 && segment.length <= 15)
-    ) {
+  for (const piece of text.split(/[^A-Za-z0-9]+/)) {
+    if (!piece) {
       continue;
     }
-    if (part.length >= 16) {
+    if (piece.length >= 16) {
       return true;
     }
-    if (part.length >= 12 && /[A-Za-z]/.test(part) && /\d/.test(part)) {
+    if (piece.length >= 12 && /[A-Za-z]/.test(piece) && /\d/.test(piece)) {
       return true;
     }
   }
@@ -71,12 +89,13 @@ export function sanitizeProviderText(value: unknown): string | undefined {
     return undefined;
   }
 
-  const clipped = clip(text, MAX_TEXT);
-  if (SECRET_TEXT.test(clipped) || hasOpaqueToken(clipped) || /[<>]/.test(clipped)) {
+  // Scan the entire field first. Clipping before the check can keep the start
+  // of a token that begins near the 180-character limit.
+  if (SECRET_TEXT.test(text) || hasOpaqueToken(text) || /[<>]/.test(text)) {
     return undefined;
   }
 
-  return clipped;
+  return clip(text, MAX_TEXT);
 }
 
 function httpStatus(value: unknown): number | undefined {
@@ -88,12 +107,8 @@ function httpStatus(value: unknown): number | undefined {
     : undefined;
 }
 
-function errorCode(value: unknown): number | string | undefined {
+function errorCode(value: unknown): number | undefined {
   if (typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= 9999) {
-    return value;
-  }
-
-  if (typeof value === 'string' && /^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(value)) {
     return value;
   }
 
@@ -105,14 +120,12 @@ function problemSlug(value: unknown): string | undefined {
     return undefined;
   }
 
-  const match = value
-    .trim()
-    .match(/^https:\/\/api\.(?:twitter|x)\.com\/2\/problems\/([A-Za-z0-9_-]{1,64})\/?$/);
-  if (match) {
-    return match[1].toLowerCase();
-  }
-
-  return errorCode(value) === value ? value : undefined;
+  const trimmed = value.trim();
+  const fromUrl = trimmed.match(
+    /^https:\/\/api\.(?:twitter|x)\.com\/2\/problems\/([A-Za-z0-9_-]{1,64})\/?$/
+  );
+  const slug = (fromUrl ? fromUrl[1] : trimmed).toLowerCase();
+  return OFFICIAL_PROBLEM_SLUGS.has(slug) ? slug : undefined;
 }
 
 function scanPiece(value: unknown): string | undefined {
@@ -154,7 +167,7 @@ function unwrapApiResponseError(err: unknown): Record<string, unknown> | undefin
 
 interface ExtractedApiError {
   httpStatus?: number;
-  code?: number | string;
+  code?: number;
   type?: string;
   title?: string;
   detail?: string;

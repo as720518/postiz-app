@@ -204,18 +204,32 @@ const runtime = spawnSync(
     `
       const { resolveConcurrentProviderError } = require(${JSON.stringify(helperOut)});
       const secret = 'SUPERSECRETTOKENVALUE';
+      const sentinel = 'SYNTHETICCredentialSentinel123456789';
       const err = Object.assign(new Error('SECRET_ONLY_IN_MESSAGE ' + secret), {
         name: 'ApiResponseError', error: true, type: 'response', code: 400,
         headers: { authorization: 'Bearer ' + secret },
         request: { url: 'https://cdn.example/a?token=' + secret },
-        data: { title: 'Invalid media', detail: 'Animated GIF is not allowed', type: 'https://api.twitter.com/2/problems/invalid-media' },
+        data: {
+          title: 'Invalid media',
+          detail: 'Animated GIF is not allowed',
+          type: 'https://api.twitter.com/2/problems/invalid-request',
+          errors: [{ code: sentinel, message: 'ab12cd34ef56' }],
+        },
       });
       const result = resolveConcurrentProviderError({ identifier: 'x', err, alreadyClassified: false });
       if (result.action !== 'throw') process.exit(3);
       const packed = JSON.stringify(result);
-      if (packed.includes(secret) || packed.includes('cdn.example') || packed.includes('Bearer')) process.exit(4);
-      if (!result.message.includes('HTTP 400') || !result.message.includes('invalid-media')) process.exit(5);
+      if (packed.includes(secret) || packed.includes(sentinel) || packed.includes('ab12cd34ef56') || packed.includes('cdn.example') || packed.includes('Bearer')) process.exit(4);
+      if (!result.message.includes('HTTP 400') || !result.message.includes('invalid-request')) process.exit(5);
       if (result.failureType !== 'bad-body') process.exit(6);
+      const unknown = resolveConcurrentProviderError({
+        identifier: 'x', err: Object.assign(new Error('x'), {
+          name: 'ApiResponseError', error: true, type: 'response', code: 400,
+          data: { type: 'https://api.x.com/2/problems/' + sentinel, errors: [{ code: 'ab12cd34ef56' }] },
+        }), alreadyClassified: false,
+      });
+      const unknownPacked = JSON.stringify(unknown);
+      if (unknownPacked.includes(sentinel) || unknownPacked.includes('ab12cd34ef56')) process.exit(7);
     `,
   ],
   { stdio: 'inherit' }
