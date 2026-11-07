@@ -1,0 +1,291 @@
+// AGPL-3.0-or-later. Part of Postiz. See the repository LICENSE.
+//
+// Turns a twitter-api-v2 ApiResponseError into the few provider fields that are
+// safe to show in the existing posts list. The SDK error also carries the
+// request, response headers, and the raw body; none of those are copied.
+
+export interface ProviderHandleResult {
+  type: 'refresh-token' | 'bad-body' | 'retry' | 'disconnect';
+  value: string;
+}
+
+export type ConcurrentProviderResolution =
+  | { action: 'rethrow-classified' }
+  | {
+      action: 'throw';
+      failureType: 'refresh-token' | 'disconnect' | 'bad-body';
+      message: string;
+      safeJson: string;
+    }
+  | { action: 'legacy' };
+
+const STATIC_REJECTION = 'X rejected the media upload';
+const MAX_TEXT = 180;
+const MAX_SCAN_FIELD = 500;
+const MAX_SCAN = 2_000;
+
+const SECRET_TEXT =
+  /[\u0000-\u001f\u007f]|:\/\/|www\.|bearer\s+|eyJ[a-z0-9_-]{8,}|%[0-9a-f]{2}|\?[^\s]*?=|[?&][a-z0-9_]+=|\b\d{7,}\b|\b(?:access_token|refresh_token|id_token|api_key|apikey|api_secret|client_secret|oauth_token|oauth_token_secret|authorization|cookie|set-cookie|password|secret)\b|[A-Za-z0-9+/]{32,}={0,2}|[A-Fa-f0-9]{32,}|@[a-z0-9.-]+\.[a-z]{2,}/i;
+
+// A short provider sentence is kept. A long opaque token is not, even when it
+// does not match a known keyword: the field is dropped instead of redacted.
+function hasOpaqueToken(text: string): boolean {
+  for (const part of text.split(/\s+/)) {
+    if (
+      /^[a-z0-9]+(?:-[a-z0-9]+){0,4}$/.test(part) &&
+      part.split('-').every((segment) => segment.length > 0 && segment.length <= 15)
+    ) {
+      continue;
+    }
+    if (part.length >= 16) {
+      return true;
+    }
+    if (part.length >= 12 && /[A-Za-z]/.test(part) && /\d/.test(part)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function own(record: Record<string, unknown>, key: string): unknown {
+  return Object.prototype.hasOwnProperty.call(record, key) ? record[key] : undefined;
+}
+
+function clip(value: string, max: number): string {
+  const chars = Array.from(value);
+  return chars.length <= max ? value : chars.slice(0, max).join('');
+}
+
+/** Returns the text only when the whole string is safe to display. */
+export function sanitizeProviderText(value: unknown): string | undefined {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+
+  const text = value.replace(/\s+/g, ' ').trim();
+  if (!text || text.length > 2_000) {
+    return undefined;
+  }
+
+  const clipped = clip(text, MAX_TEXT);
+  if (SECRET_TEXT.test(clipped) || hasOpaqueToken(clipped) || /[<>]/.test(clipped)) {
+    return undefined;
+  }
+
+  return clipped;
+}
+
+function httpStatus(value: unknown): number | undefined {
+  return typeof value === 'number' &&
+    Number.isInteger(value) &&
+    value >= 100 &&
+    value <= 599
+    ? value
+    : undefined;
+}
+
+function errorCode(value: unknown): number | string | undefined {
+  if (typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= 9999) {
+    return value;
+  }
+
+  if (typeof value === 'string' && /^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(value)) {
+    return value;
+  }
+
+  return undefined;
+}
+
+function problemSlug(value: unknown): string | undefined {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+
+  const match = value
+    .trim()
+    .match(/^https:\/\/api\.(?:twitter|x)\.com\/2\/problems\/([A-Za-z0-9_-]{1,64})\/?$/);
+  if (match) {
+    return match[1].toLowerCase();
+  }
+
+  return errorCode(value) === value ? value : undefined;
+}
+
+function scanPiece(value: unknown): string | undefined {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+
+  const text = value.replace(/\s+/g, ' ').trim();
+  if (!text) {
+    return undefined;
+  }
+
+  return clip(text, MAX_SCAN_FIELD);
+}
+
+function isApiResponseError(value: unknown): value is Record<string, unknown> {
+  if (!isRecord(value)) {
+    return false;
+  }
+
+  return (
+    value.name === 'ApiResponseError' &&
+    value.error === true &&
+    (value.type === 'response' || typeof value.code === 'number')
+  );
+}
+
+function unwrapApiResponseError(err: unknown): Record<string, unknown> | undefined {
+  if (isApiResponseError(err)) {
+    return err;
+  }
+
+  if (isRecord(err) && isApiResponseError(err.cause)) {
+    return err.cause;
+  }
+
+  return undefined;
+}
+
+interface ExtractedApiError {
+  httpStatus?: number;
+  code?: number | string;
+  type?: string;
+  title?: string;
+  detail?: string;
+  scanText: string;
+}
+
+function extractApiResponseError(err: unknown): ExtractedApiError | undefined {
+  const api = unwrapApiResponseError(err);
+  if (!api) {
+    return undefined;
+  }
+
+  const data = isRecord(api.data) ? api.data : undefined;
+  const firstError =
+    data && Array.isArray(data.errors) && isRecord(data.errors[0])
+      ? data.errors[0]
+      : undefined;
+  const status = httpStatus(api.code) ?? (data ? httpStatus(own(data, 'status')) : undefined);
+  const code = firstError ? errorCode(own(firstError, 'code')) : undefined;
+  const type = data ? problemSlug(own(data, 'type')) : undefined;
+  const title = data ? sanitizeProviderText(own(data, 'title')) : undefined;
+  const detail =
+    (data ? sanitizeProviderText(own(data, 'detail')) : undefined) ??
+    (firstError ? sanitizeProviderText(own(firstError, 'message')) : undefined);
+  // Existing X handleErrors matches JSON fragments such as "title":"Unauthorized".
+  // The scan payload is only those raw fields, it is not stored, and it never
+  // includes headers, the request, or the rest of the body.
+  const scanPayload: Record<string, string> = {};
+  const rawTitle = data ? scanPiece(own(data, 'title')) : undefined;
+  const rawDetail = data ? scanPiece(own(data, 'detail')) : undefined;
+  const rawType = data ? scanPiece(own(data, 'type')) : undefined;
+  const rawMessage = firstError ? scanPiece(own(firstError, 'message')) : undefined;
+  if (rawTitle) {
+    scanPayload.title = rawTitle;
+  }
+  if (rawDetail) {
+    scanPayload.detail = rawDetail;
+  }
+  if (rawType) {
+    scanPayload.type = rawType;
+  }
+  if (rawMessage) {
+    scanPayload.message = rawMessage;
+  }
+  const scanText = JSON.stringify(scanPayload).slice(0, MAX_SCAN);
+
+  return { httpStatus: status, code, type, title, detail, scanText };
+}
+
+function summaryOf(extracted: ExtractedApiError): string {
+  const parts: string[] = [];
+  if (extracted.httpStatus) {
+    parts.push(`HTTP ${extracted.httpStatus}`);
+  }
+  if (extracted.code !== undefined) {
+    parts.push(`code ${extracted.code}`);
+  }
+  if (extracted.type) {
+    parts.push(`type ${extracted.type}`);
+  }
+  if (extracted.title) {
+    parts.push(`title: ${extracted.title}`);
+  }
+  if (extracted.detail) {
+    parts.push(`detail: ${extracted.detail}`);
+  }
+
+  return parts.length ? `${STATIC_REJECTION} (${parts.join(', ')})` : STATIC_REJECTION;
+}
+
+function safeJsonOf(extracted: ExtractedApiError): string {
+  const payload: Record<string, string | number> = {};
+  if (extracted.httpStatus) {
+    payload.httpStatus = extracted.httpStatus;
+  }
+  if (extracted.code !== undefined) {
+    payload.code = extracted.code;
+  }
+  if (extracted.type) {
+    payload.type = extracted.type;
+  }
+  if (extracted.title) {
+    payload.title = extracted.title;
+  }
+  if (extracted.detail) {
+    payload.detail = extracted.detail;
+  }
+
+  return JSON.stringify(payload);
+}
+
+/**
+ * Decides what runInConcurrent should do with a thrown error.
+ * Already-classified provider failures are returned untouched. An X
+ * ApiResponseError becomes a curated failure whose message and JSON contain
+ * only whitelisted fields. Every other error keeps the historical path.
+ */
+export function resolveConcurrentProviderError(input: {
+  identifier: string;
+  err: unknown;
+  alreadyClassified: boolean;
+  handleErrors?: (body: string, status: number) => ProviderHandleResult | undefined;
+}): ConcurrentProviderResolution {
+  if (input.alreadyClassified) {
+    return { action: 'rethrow-classified' };
+  }
+
+  if (input.identifier !== 'x') {
+    return { action: 'legacy' };
+  }
+
+  const extracted = extractApiResponseError(input.err);
+  if (!extracted) {
+    return { action: 'legacy' };
+  }
+
+  const safeJson = safeJsonOf(extracted);
+  const handle = input.handleErrors?.(extracted.scanText || safeJson, extracted.httpStatus ?? 0);
+  const mapped =
+    handle?.value && handle.value !== 'Unknown Error' ? handle.value : undefined;
+  const failureType =
+    handle?.type === 'refresh-token'
+      ? 'refresh-token'
+      : handle?.type === 'disconnect'
+      ? 'disconnect'
+      : 'bad-body';
+
+  return {
+    action: 'throw',
+    failureType,
+    message: mapped || summaryOf(extracted),
+    safeJson,
+  };
+}
