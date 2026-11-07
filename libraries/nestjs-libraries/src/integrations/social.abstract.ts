@@ -508,10 +508,9 @@ export abstract class SocialAbstract {
       value = await func();
     } catch (err) {
       // A provider that already chose BadBody / RefreshToken / Disconnect keeps
-      // that failure. twitter-api-v2 ApiResponseError never reaches handleErrors
-      // through this.fetch; for X, keep only its whitelisted status, code, type,
-      // title, and detail. The request, headers, and raw body are not copied.
-      // Anything else stays on the historical Unknown Error path.
+      // that failure. X upload errors are classified from the SDK class and a
+      // closed category, never from err.message. Other providers keep the
+      // historical Unknown Error path.
       const resolution = resolveConcurrentProviderError({
         identifier: this.identifier,
         err,
@@ -535,11 +534,10 @@ export abstract class SocialAbstract {
         }
         throw new BadBody(this.identifier, safeJson, '{}', message);
       }
-      // X failures that are not an ApiResponseError keep the Unknown Error
-      // placeholder, but the raw error is not serialized. Other providers keep
-      // the historical path, including YouTube.
+      // Resolver returns throw for every X error. This remains so a missed
+      // branch still cannot store Unknown Error or the raw exception.
       if (this.identifier === 'x') {
-        value = { err: true, value: 'Unknown Error' };
+        value = { err: true, value: 'X rejected the media upload (unclassified)' };
         globalErr = {};
       } else {
         const handle = this.handleErrors(safeStringify(err), 200);

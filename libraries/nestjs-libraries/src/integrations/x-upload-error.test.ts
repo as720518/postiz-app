@@ -14,11 +14,19 @@ const SIGNED =
   'https://cdn.example/image.jpg?X-Amz-Signature=' + SECRET + '&user=123456789012345678';
 const ACCOUNT_ID = '998877665544332211';
 
+function withConstructor(err: Error, ctorName: string) {
+  const ctor = function SdkError() {};
+  Object.defineProperty(ctor, 'name', { value: ctorName });
+  Object.defineProperty(err, 'constructor', { value: ctor });
+  return err;
+}
+
 function apiError(data: unknown, code = 400, extras: Record<string, unknown> = {}) {
+  // twitter-api-v2@1.29.0 leaves the instance name as "Error".
   const err = new Error(
     `Request failed with code ${code} - SECRET_ONLY_IN_MESSAGE ${SIGNED}`
   );
-  err.name = 'ApiResponseError';
+  withConstructor(err, 'ApiResponseError');
   return Object.assign(err, {
     error: true,
     type: 'response',
@@ -155,9 +163,11 @@ test('representative ApiResponseError exposes only whitelisted fields', () => {
   assert.equal(resolution.failureType, 'bad-body');
   assert.equal(
     resolution.message,
-    'X rejected the media upload (HTTP 400, code 324, type invalid-request, title: Invalid Request, detail: The image dimensions are too small)'
+    'X rejected the media upload (response, HTTP 400, code 324, type invalid-request, title: Invalid Request, detail: The image dimensions are too small)'
   );
+  assert.equal(resolution.message.includes('SECRET_ONLY_IN_MESSAGE'), false);
   assert.deepEqual(JSON.parse(resolution.safeJson), {
+    category: 'response',
     httpStatus: 400,
     code: 324,
     type: 'invalid-request',
@@ -310,15 +320,38 @@ test('already classified failures are rethrown before any rewrite', () => {
   );
 });
 
-test('plain errors and other providers stay on the legacy path', () => {
-  assert.equal(
-    resolveConcurrentProviderError({
+test('request, partial, processing, and unknown X errors stay static', () => {
+  const request = withConstructor(new Error(`Request failed. ${SECRET}`), 'ApiRequestError');
+  Object.assign(request, { error: true, type: 'request', request: { url: SIGNED } });
+  const partial = withConstructor(new Error(`partial ${SECRET}`), 'ApiPartialResponseError');
+  Object.assign(partial, { error: true, type: 'partial-response', rawContent: SECRET });
+  const processing = new Error(`Media processing failed: dimensions ${SECRET}`);
+  const plain = new Error(`sharp failed ${SECRET}`);
+
+  for (const [err, category] of [
+    [request, 'request'],
+    [partial, 'partial-response'],
+    [processing, 'media-processing'],
+    [plain, 'unclassified'],
+  ] as const) {
+    const resolution = resolveConcurrentProviderError({
       identifier: 'x',
       alreadyClassified: false,
-      err: new Error(`sharp failed ${SECRET}`),
-    }).action,
-    'legacy'
-  );
+      err,
+    });
+    assert.equal(resolution.action, 'throw');
+    if (resolution.action !== 'throw') {
+      continue;
+    }
+    assert.equal(resolution.failureType, 'bad-body');
+    assert.equal(resolution.message, `X rejected the media upload (${category})`);
+    assert.equal(JSON.parse(resolution.safeJson).category, category);
+    assertNoSecrets(JSON.stringify(resolution));
+    assert.equal(resolution.message.includes(SECRET), false);
+  }
+});
+
+test('plain errors and other providers stay on the legacy path', () => {
   assert.equal(
     resolveConcurrentProviderError({
       identifier: 'youtube',
@@ -363,7 +396,7 @@ test('empty ApiResponseError still replaces Unknown Error with a static sentence
   if (resolution.action !== 'throw') {
     return;
   }
-  assert.equal(resolution.message, 'X rejected the media upload (HTTP 400)');
+  assert.equal(resolution.message, 'X rejected the media upload (response, HTTP 400)');
   assert.notEqual(resolution.message, 'Unknown Error');
 });
 

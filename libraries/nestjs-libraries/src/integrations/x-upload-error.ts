@@ -20,6 +20,17 @@ export type ConcurrentProviderResolution =
   | { action: 'legacy' };
 
 const STATIC_REJECTION = 'X rejected the media upload';
+// twitter-api-v2@1.29.0 client.v2.uploadMedia throws this exact prefix from
+// `new Error(...)` when processing_info.state is failed. The suffix is the
+// provider text and is not stored.
+const MEDIA_PROCESSING_PREFIX = 'Media processing failed:';
+
+type FailureCategory =
+  | 'response'
+  | 'request'
+  | 'partial-response'
+  | 'media-processing'
+  | 'unclassified';
 const MAX_TEXT = 180;
 const MAX_SCAN_FIELD = 500;
 const MAX_SCAN = 2_000;
@@ -98,7 +109,7 @@ export function sanitizeProviderText(value: unknown): string | undefined {
   return clip(text, MAX_TEXT);
 }
 
-function httpStatus(value: unknown): number | undefined {
+function readHttpStatus(value: unknown): number | undefined {
   return typeof value === 'number' &&
     Number.isInteger(value) &&
     value >= 100 &&
@@ -141,31 +152,71 @@ function scanPiece(value: unknown): string | undefined {
   return clip(text, MAX_SCAN_FIELD);
 }
 
-function isApiResponseError(value: unknown): value is Record<string, unknown> {
-  if (!isRecord(value)) {
-    return false;
+// twitter-api-v2@1.29.0 leaves the instance name as "Error". The class is on
+// constructor.name. Only these three names are recognized; anything else is
+// not copied into the stored error.
+function sdkConstructorName(err: object): string | undefined {
+  const ctor = (err as { constructor?: { name?: unknown } }).constructor;
+  const name = ctor && typeof ctor.name === 'string' ? ctor.name : undefined;
+  if (
+    name === 'ApiResponseError' ||
+    name === 'ApiRequestError' ||
+    name === 'ApiPartialResponseError'
+  ) {
+    return name;
   }
+  return undefined;
+}
 
-  return (
-    value.name === 'ApiResponseError' &&
-    value.error === true &&
-    (value.type === 'response' || typeof value.code === 'number')
-  );
+function isSdkResponse(err: Record<string, unknown>): boolean {
+  return sdkConstructorName(err) === 'ApiResponseError' && err.error === true && err.type === 'response';
+}
+
+function categoryOf(err: unknown): FailureCategory | undefined {
+  if (!isRecord(err)) {
+    return undefined;
+  }
+  if (isSdkResponse(err)) {
+    return 'response';
+  }
+  if (sdkConstructorName(err) === 'ApiRequestError' && err.error === true && err.type === 'request') {
+    return 'request';
+  }
+  if (
+    sdkConstructorName(err) === 'ApiPartialResponseError' &&
+    err.error === true &&
+    err.type === 'partial-response'
+  ) {
+    return 'partial-response';
+  }
+  const ctor = (err as { constructor?: { name?: unknown } }).constructor;
+  if (
+    ctor &&
+    ctor.name === 'Error' &&
+    typeof err.message === 'string' &&
+    err.message.startsWith(MEDIA_PROCESSING_PREFIX)
+  ) {
+    return 'media-processing';
+  }
+  return undefined;
+}
+
+function failureCategory(err: unknown): FailureCategory {
+  return categoryOf(err) ?? (isRecord(err) ? categoryOf(err.cause) : undefined) ?? 'unclassified';
 }
 
 function unwrapApiResponseError(err: unknown): Record<string, unknown> | undefined {
-  if (isApiResponseError(err)) {
+  if (isRecord(err) && isSdkResponse(err)) {
     return err;
   }
-
-  if (isRecord(err) && isApiResponseError(err.cause)) {
+  if (isRecord(err) && isRecord(err.cause) && isSdkResponse(err.cause)) {
     return err.cause;
   }
-
   return undefined;
 }
 
 interface ExtractedApiError {
+  category: FailureCategory;
   httpStatus?: number;
   code?: number;
   type?: string;
@@ -185,7 +236,7 @@ function extractApiResponseError(err: unknown): ExtractedApiError | undefined {
     data && Array.isArray(data.errors) && isRecord(data.errors[0])
       ? data.errors[0]
       : undefined;
-  const status = httpStatus(api.code) ?? (data ? httpStatus(own(data, 'status')) : undefined);
+  const status = readHttpStatus(api.code) ?? (data ? readHttpStatus(own(data, 'status')) : undefined);
   const code = firstError ? errorCode(own(firstError, 'code')) : undefined;
   const type = data ? problemSlug(own(data, 'type')) : undefined;
   const title = data ? sanitizeProviderText(own(data, 'title')) : undefined;
@@ -214,11 +265,11 @@ function extractApiResponseError(err: unknown): ExtractedApiError | undefined {
   }
   const scanText = JSON.stringify(scanPayload).slice(0, MAX_SCAN);
 
-  return { httpStatus: status, code, type, title, detail, scanText };
+  return { category: 'response', httpStatus: status, code, type, title, detail, scanText };
 }
 
 function summaryOf(extracted: ExtractedApiError): string {
-  const parts: string[] = [];
+  const parts: string[] = [extracted.category];
   if (extracted.httpStatus) {
     parts.push(`HTTP ${extracted.httpStatus}`);
   }
@@ -239,7 +290,7 @@ function summaryOf(extracted: ExtractedApiError): string {
 }
 
 function safeJsonOf(extracted: ExtractedApiError): string {
-  const payload: Record<string, string | number> = {};
+  const payload: Record<string, string | number> = { category: extracted.category };
   if (extracted.httpStatus) {
     payload.httpStatus = extracted.httpStatus;
   }
@@ -263,7 +314,8 @@ function safeJsonOf(extracted: ExtractedApiError): string {
  * Decides what runInConcurrent should do with a thrown error.
  * Already-classified provider failures are returned untouched. An X
  * ApiResponseError becomes a curated failure whose message and JSON contain
- * only whitelisted fields. Every other error keeps the historical path.
+ * only whitelisted fields. Other X failures get a closed static category.
+ * Non-X providers keep the historical path.
  */
 export function resolveConcurrentProviderError(input: {
   identifier: string;
@@ -279,9 +331,30 @@ export function resolveConcurrentProviderError(input: {
     return { action: 'legacy' };
   }
 
+  const category = failureCategory(input.err);
+  if (category !== 'response') {
+    const status = isRecord(input.err) ? readHttpStatus(input.err.code) : undefined;
+    const extracted: ExtractedApiError = {
+      category,
+      httpStatus: status,
+      scanText: '',
+    };
+    return {
+      action: 'throw',
+      failureType: 'bad-body',
+      message: summaryOf(extracted),
+      safeJson: safeJsonOf(extracted),
+    };
+  }
+
   const extracted = extractApiResponseError(input.err);
   if (!extracted) {
-    return { action: 'legacy' };
+    return {
+      action: 'throw',
+      failureType: 'bad-body',
+      message: `${STATIC_REJECTION} (unclassified)`,
+      safeJson: JSON.stringify({ category: 'unclassified' }),
+    };
   }
 
   const safeJson = safeJsonOf(extracted);

@@ -30,6 +30,7 @@ import { XDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/x.
 import { Rules } from '@gitroom/nestjs-libraries/chat/rules.description.decorator';
 import { hasExtension } from '@gitroom/helpers/utils/has.extension';
 import { isAllowedUploadPath } from '@gitroom/helpers/utils/valid.url.path';
+import { encodeXImage } from '../x-image-media';
 
 // Travels through the workflow history between postPending, checkPostStatus
 // and finalizePost - keep it small JSON (media ids and the tweet content).
@@ -738,34 +739,34 @@ export class XProvider extends SocialAbstract implements SocialProvider {
                   // converts every image to GIF) can't be reused for them -
                   // article images are uploaded as JPEG with the tweet_image
                   // category the article references them by.
-                  mediaId: await this.uploadWithRateLimitRetry(async () =>
-                    asArticleImage
-                      ? client.v2.uploadMedia(
-                          await sharp(await this.readOrFetch(m.path))
-                            .resize({
-                              width: 1000,
-                            })
-                            .jpeg()
-                            .toBuffer(),
-                          {
-                            media_type: 'image/jpeg' as any,
-                            media_category: 'tweet_image' as any,
-                          }
-                        )
-                      : client.v2.uploadMedia(
-                          await sharp(await this.readOrFetch(m.path), {
-                            animated: lookup(m.path) === 'image/gif',
-                          })
-                            .resize({
-                              width: 1000,
-                            })
-                            .gif()
-                            .toBuffer(),
-                          {
-                            media_type: (lookup(m.path) || '') as any,
-                          }
-                        )
-                  ),
+                  mediaId: await this.uploadWithRateLimitRetry(async () => {
+                    const input = await this.readOrFetch(m.path);
+                    if (asArticleImage) {
+                      return client.v2.uploadMedia(
+                        await sharp(input).resize({ width: 1000 }).jpeg().toBuffer(),
+                        {
+                          media_type: 'image/jpeg' as any,
+                          media_category: 'tweet_image' as any,
+                        }
+                      );
+                    }
+                    // Declare the type of the buffer that is uploaded. A JPEG or
+                    // PNG stays that format; only an unrecognized still is
+                    // re-encoded as JPEG. GIF stays animated GIF.
+                    const prepared = await encodeXImage(input, async (bytes, kind) => {
+                      const pipeline = sharp(
+                        bytes,
+                        kind === 'gif' ? { animated: true } : undefined
+                      ).resize({ width: 1000 });
+                      if (kind === 'gif') return pipeline.gif().toBuffer();
+                      if (kind === 'png') return pipeline.png().toBuffer();
+                      return pipeline.jpeg().toBuffer();
+                    });
+                    return client.v2.uploadMedia(prepared.buffer, {
+                      media_type: prepared.mediaType as any,
+                      media_category: prepared.mediaCategory as any,
+                    });
+                  }),
                   processing: false,
                 },
           true
